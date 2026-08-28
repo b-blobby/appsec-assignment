@@ -4,12 +4,23 @@ from datetime import datetime
 from typing import List, Optional
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
-
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+import logging_filters
 import models
 import sharing
 from auth import create_access_token, get_current_user, get_password_hash, verify_password
@@ -18,6 +29,9 @@ from database import engine, get_db, search_scans_by_query
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# FIX 4: scrub credentials out of logs before anything is emitted.
+logging_filters.install()
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -122,12 +136,11 @@ class ShareOut(BaseModel):
 class SharedScanOut(BaseModel):
     """Deliberately narrower than ScanOut.
 
-    This is the only object an unauthenticated third party ever sees, so it is
-    defined field-by-field rather than reusing ScanOut. Reusing ScanOut would
-    leak owner_id (an internal user identifier) and remediation_notes (internal
-    commentary about how a vulnerability will be fixed, which is exactly what
-    you do not want to hand an outsider). Any field added to ScanOut later is
-    private by default instead of silently becoming public.
+    The only object an unauthenticated third party ever sees, so it is defined
+    field-by-field rather than reusing ScanOut. Reusing ScanOut would leak
+    owner_id and remediation_notes — internal commentary about how a
+    vulnerability will be fixed. Any field added to ScanOut later stays private
+    by default.
     """
 
     id: int
@@ -181,14 +194,16 @@ def register(payload: UserRegister, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(payload: UserLogin, db: Session = Depends(get_db)):
-    logger.info("Login attempt — username: %s password: %s", payload.username, payload.password)
+    # FIX 4 (H3, High): the password was previously logged in cleartext on both
+    # the attempt and the failure path, copying user credentials into log
+    # aggregation and backups where they far outlive the password itself. The
+    # failure path was the worse of the two: failed logins routinely contain
+    # passwords for *other* systems, typed by mistake. Username only now — it is
+    # still needed for audit and brute-force alerting.
+    logger.info("Login attempt — username: %s", payload.username)
     user = db.query(models.User).filter(models.User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
-        logger.warning(
-            "Failed login — username: '%s' password: '%s'",
-            payload.username,
-            payload.password,
-        )
+        logger.warning("Failed login — username: %s", payload.username)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
@@ -244,7 +259,10 @@ def search_scans(
 ):
     if not q or len(q) < 2:
         raise HTTPException(status_code=400, detail="Search query must be at least 2 characters")
-    results = search_scans_by_query(db, q)
+    # FIX 3b (H2, High): search had no owner filter at all, so it returned
+    # every tenant's scans regardless of who asked. Found while fixing C2 —
+    # no scanner reported it.
+    results = search_scans_by_query(db, q, current_user.id)
     return {"results": results, "count": len(results)}
 
 
@@ -254,7 +272,14 @@ def get_scan(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    scan = db.query(models.ScanResult).filter(models.ScanResult.id == scan_id).first()
+    # FIX 3a (H2, High): this filtered on id only, so any authenticated user
+    # could read any other tenant's scan by incrementing the id. The owner_id
+    # filter matches what update_scan and delete_scan already did. 404 rather
+    # than 403 so the endpoint cannot be used to enumerate which ids exist.
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     return scan
@@ -308,6 +333,7 @@ def delete_scan(
     db.commit()
 
 
+
 # ---------------------------------------------------------------------------
 # Shared report links
 # ---------------------------------------------------------------------------
@@ -320,9 +346,8 @@ def create_share_link(
     current_user: models.User = Depends(get_current_user),
 ):
     """Mint a 24-hour share link for a scan the caller owns."""
-    # Ownership is enforced in the query itself, so a scan belonging to someone
-    # else can never be shared. A miss returns 404 rather than 403 so the
-    # endpoint cannot be used to enumerate which scan IDs exist.
+    # Ownership enforced in the query itself. A miss returns 404 rather than
+    # 403 so this cannot be used to enumerate which scan IDs exist.
     scan = (
         db.query(models.ScanResult)
         .filter(
@@ -355,14 +380,11 @@ def create_share_link(
     db.commit()
     db.refresh(link)
 
-    # Log the event without the token. Logging the token would put a working
-    # credential into log aggregation, where it outlives the 24-hour window.
+    # Log the event without the token — logging it would put a live credential
+    # into log aggregation, where it outlives the 24-hour window.
     logger.info(
         "Share link %s created for scan %s by user %s (protected=%s)",
-        link.id,
-        scan.id,
-        current_user.id,
-        password_hash is not None,
+        link.id, scan.id, current_user.id, password_hash is not None,
     )
 
     return ShareOut(
@@ -376,21 +398,14 @@ def create_share_link(
 def read_shared_scan(
     response: Response,
     token: str = Path(..., max_length=sharing.MAX_TOKEN_LENGTH),
-    password: Optional[str] = Query(
-        default=None,
-        max_length=256,
-        description=(
-            "Required if the link is password protected. Prefer the "
-            "X-Share-Password header where the client supports it."
-        ),
-    ),
+    password: Optional[str] = Query(default=None, max_length=256),
     x_share_password: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    """Public endpoint. No authentication — the token is the credential."""
+    """Public endpoint. No authentication — the token *is* the credential."""
     # Stop the token leaking onward: no-store keeps it out of shared caches,
-    # and no-referrer stops the browser putting the full URL (token included)
-    # into the Referer header of any outbound link on the rendered page.
+    # no-referrer stops the browser putting the full URL (token included) into
+    # the Referer header of any outbound link on the rendered page.
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
 
@@ -400,17 +415,13 @@ def read_shared_scan(
         .first()
     )
 
-    # Unknown token: generic 404. We never say "that token existed once".
-    if not link:
-        raise HTTPException(status_code=404, detail="Share link not found")
-
-    if link.revoked_at is not None:
+    if not link or link.revoked_at is not None:
         raise HTTPException(status_code=404, detail="Share link not found")
 
     if link.expires_at <= sharing.utcnow():
-        # 410 Gone is honest and useful here — the token is unguessable, so
-        # confirming it expired gives an attacker nothing, and it tells a
-        # legitimate auditor to go ask for a fresh link.
+        # 410 Gone is honest and useful: the token is unguessable, so admitting
+        # it expired gives an attacker nothing, and it tells a legitimate
+        # auditor to request a fresh link.
         raise HTTPException(status_code=410, detail="Share link has expired")
 
     if link.password_hash is not None:
@@ -423,16 +434,23 @@ def read_shared_scan(
         if supplied is None:
             raise HTTPException(status_code=401, detail="This link requires a password")
 
+        # FIX 4: the query parameter is kept because the brief specifies it, but
+        # it puts a credential in the URL. The header is preferred, access logs
+        # are scrubbed, and query-string callers are told to migrate.
+        if x_share_password is None:
+            response.headers["Deprecation"] = "true"
+            response.headers["Warning"] = (
+                '299 - "password query parameter is deprecated; '
+                'use the X-Share-Password header"'
+            )
+
         if not sharing.verify_share_password(supplied, link.password_hash):
-            # Persist the counter so the limit survives a process restart and
-            # applies across workers, unlike an in-memory rate limiter.
+            # Persisted so the limit survives restarts and applies across workers.
             link.failed_attempts += 1
             db.commit()
             logger.warning(
-                "Failed password attempt %s/%s on share link %s",
-                link.failed_attempts,
-                sharing.MAX_FAILED_ATTEMPTS,
-                link.id,
+                "Failed attempt %s/%s on share link %s",
+                link.failed_attempts, sharing.MAX_FAILED_ATTEMPTS, link.id,
             )
             raise HTTPException(status_code=401, detail="Invalid password")
 
@@ -442,7 +460,6 @@ def read_shared_scan(
 
     scan = db.query(models.ScanResult).filter(models.ScanResult.id == link.scan_id).first()
     if not scan:
-        # Underlying scan was deleted; the link is meaningless now.
         raise HTTPException(status_code=404, detail="Share link not found")
 
     return scan

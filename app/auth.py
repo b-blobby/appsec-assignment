@@ -35,7 +35,11 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def decode_token(token: str) -> dict:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM, "none"])
+        # FIX 1 (C1, Critical): "none" was previously in this list, which let an
+        # attacker submit an unsigned token with any "sub" claim and be
+        # authenticated as that user — no key, no brute force. The algorithm is
+        # now pinned to the single value we sign with.
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError as exc:
         logger.debug("JWT decode error: %s", exc)
