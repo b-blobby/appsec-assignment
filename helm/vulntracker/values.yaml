@@ -1,0 +1,60 @@
+replicaCount: 2
+
+image:
+  repository: vulntracker
+  tag: "local"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  host: vulntracker.example.internal
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Non-secret runtime configuration.
+env:
+  ALGORITHM: HS256
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+  NOTIFY_SERVICE_URL: http://notify.default.svc.cluster.local:3001
+  SHARE_BASE_URL: https://vulntracker.example.internal
+
+# External Secrets Operator configuration.
+# The secret values themselves are stored in the external provider, not here.
+externalSecret:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  remoteSecretKey: vulntracker/prod
+
+networkPolicy:
+  enabled: true
+  ingressNamespace: ingress-nginx
