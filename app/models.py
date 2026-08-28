@@ -35,3 +35,36 @@ class ScanResult(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     owner = relationship("User", back_populates="scans")
+
+    share_links = relationship(
+        "ShareLink", back_populates="scan", cascade="all, delete-orphan"
+    )
+
+
+class ShareLink(Base):
+    """A time-limited, optionally password-protected pointer to one scan."""
+
+    __tablename__ = "share_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # SHA-256 hex digest of the token. The raw token is returned to the caller
+    # exactly once and is never persisted.
+    token_hash = Column(String(64), unique=True, index=True, nullable=False)
+
+    scan_id = Column(
+        Integer, ForeignKey("scan_results.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # NULL means the link is not password protected.
+    password_hash = Column(String(200), nullable=True)
+
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+
+    failed_attempts = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    scan = relationship("ScanResult", back_populates="share_links")
